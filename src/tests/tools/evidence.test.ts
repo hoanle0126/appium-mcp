@@ -8,7 +8,7 @@ jest.unstable_mockModule('../../session-store', () => ({
   getSessionInfo: jest.fn(() => null),
 }));
 
-const {classifyError, isEvidenceEnabled, withEvidence} = await import('../../tools/evidence.js');
+const {buildFailureReason, classifyError, isEvidenceEnabled, withEvidence} = await import('../../tools/evidence.js');
 
 const ENV_KEY = 'APPIUM_MCP_EVIDENCE';
 
@@ -145,6 +145,7 @@ describe('withEvidence', () => {
     expect(record.action.locator).toEqual({strategy: 'id', selector: 'btn'});
     expect(record.action.element).toEqual({webdriverId: 'el-1'});
     expect(record.error).toBeUndefined();
+    expect(record.reason).toBeUndefined();
     expect(record.timing.durationMs).toBeGreaterThanOrEqual(0);
     expect(record.timing.startedAt).toBe(new Date(startedAt).toISOString());
   });
@@ -156,6 +157,7 @@ describe('withEvidence', () => {
         name: 'appium_find_element',
         stage: 'locate',
         startedAt: Date.now(),
+        element: {webdriverId: 'el-stale'},
         error: new Error('stale element reference'),
       }),
     );
@@ -163,6 +165,12 @@ describe('withEvidence', () => {
     expect(record.status).toBe('error');
     expect(record.error?.code).toBe('STALE_ELEMENT');
     expect(record.error?.message).toBe('stale element reference');
+    expect(record.reason).toEqual({
+      hypothesis:
+        'The previously located element reference is stale because the UI re-rendered or navigated away; re-locate the element before interacting',
+      confidence: 0.85,
+      signals: ['Element ID: el-stale', 'Stage: locate', 'Error code: STALE_ELEMENT'],
+    });
   });
 
   test('falls back to result text when no error object is supplied', () => {
@@ -178,5 +186,114 @@ describe('withEvidence', () => {
     expect(record.status).toBe('error');
     expect(record.error?.code).toBe('TIMEOUT');
     expect(record.error?.message).toBe('The operation timed out');
+    expect(record.reason).toEqual({
+      hypothesis: 'The operation timed out while waiting for the device or application to respond',
+      confidence: 0.75,
+      signals: ['Stage: interact', 'Error code: TIMEOUT'],
+    });
+  });
+});
+
+describe('buildFailureReason', () => {
+  test('flags CSS selector used in NATIVE_APP context', () => {
+    const reason = buildFailureReason(
+      {code: 'ELEMENT_NOT_FOUND', message: 'no such element'},
+      {
+        name: 'appium_find_element',
+        stage: 'locate',
+        locator: {strategy: 'css selector', selector: '.login-btn'},
+        context: {platform: 'Android', contextName: 'NATIVE_APP'},
+      },
+    );
+
+    expect(reason.confidence).toBe(0.85);
+    expect(reason.hypothesis).toContain('CSS selector was used while in NATIVE_APP context');
+    expect(reason.signals).toContain(
+      "Context mismatch: strategy 'css selector' requires a WEBVIEW context, but active context is 'NATIVE_APP'",
+    );
+  });
+
+  test('flags native locator strategy used in WEBVIEW context', () => {
+    const reason = buildFailureReason(
+      {code: 'ELEMENT_NOT_FOUND', message: 'no such element'},
+      {
+        name: 'appium_find_element',
+        stage: 'locate',
+        locator: {strategy: 'accessibility id', selector: 'login'},
+        context: {platform: 'iOS', contextName: 'WEBVIEW_1234'},
+      },
+    );
+
+    expect(reason.confidence).toBe(0.85);
+    expect(reason.hypothesis).toContain("Native locator strategy 'accessibility id' was used while in WEBVIEW context");
+    expect(reason.signals).toContain(
+      "Context mismatch: native strategy 'accessibility id' used in web context 'WEBVIEW_1234'",
+    );
+  });
+
+  test('flags platform-specific locator mismatch', () => {
+    const reason = buildFailureReason(
+      {code: 'INVALID_SELECTOR', message: 'invalid selector'},
+      {
+        name: 'appium_find_element',
+        stage: 'locate',
+        locator: {strategy: '-ios predicate string', selector: 'label == "Sign in"'},
+        context: {platform: 'Android', contextName: 'NATIVE_APP'},
+      },
+    );
+
+    expect(reason.confidence).toBe(0.9);
+    expect(reason.hypothesis).toBe(
+      "The locator strategy '-ios predicate string' is not supported on platform 'Android'",
+    );
+    expect(reason.signals).toContain("Platform mismatch: strategy '-ios predicate string' used on platform 'Android'");
+  });
+
+  test('highlights XPath brittleness on ELEMENT_NOT_FOUND', () => {
+    const reason = buildFailureReason(
+      {code: 'ELEMENT_NOT_FOUND', message: 'no such element'},
+      {
+        name: 'appium_find_element',
+        stage: 'locate',
+        locator: {strategy: 'xpath', selector: '//XCUIElementTypeButton[1]'},
+        context: {platform: 'iOS', contextName: 'NATIVE_APP'},
+      },
+    );
+
+    expect(reason.confidence).toBe(0.65);
+    expect(reason.hypothesis).toContain('XPath selector is too brittle');
+    expect(reason.signals).toContain('XPath selectors are sensitive to view hierarchy changes');
+  });
+
+  test.each([
+    ['ELEMENT_NOT_FOUND' as const, 'locate' as const, 0.7, 'The target element was not found in the current hierarchy'],
+    ['TIMEOUT' as const, 'locate' as const, 0.75, 'Locating the element timed out'],
+    ['CONTEXT_NOT_AVAILABLE' as const, undefined, 0.85, 'The requested context is not available'],
+    ['INVALID_SELECTOR' as const, 'locate' as const, 0.9, "The selector syntax is invalid for locator strategy 'id'"],
+    [
+      'ACTION_FAILED' as const,
+      'interact' as const,
+      0.55,
+      'The interaction failed; the target element may be obscured by an overlay',
+    ],
+    [
+      'ACTION_FAILED' as const,
+      undefined,
+      0.4,
+      'The tool action failed due to an unexpected driver or application error',
+    ],
+  ])('builds hypothesis for %s (stage=%s)', (code, stage, expectedConfidence, expectedSubstring) => {
+    const reason = buildFailureReason(
+      {code, message: 'err'},
+      {
+        name: 'appium_find_element',
+        stage,
+        locator: {strategy: 'id', selector: 'submit'},
+      },
+    );
+
+    expect(reason.confidence).toBe(expectedConfidence);
+    expect(reason.hypothesis).toContain(expectedSubstring);
+    expect(reason.signals).toContain(`Error code: ${code}`);
   });
 });

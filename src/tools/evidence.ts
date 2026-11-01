@@ -33,6 +33,17 @@ export interface ActionEvidenceRecord {
   };
   timing: {startedAt: string; finishedAt: string; durationMs: number};
   error?: {code: EvidenceErrorCode; message: string};
+  /**
+   * Non-authoritative failure hypothesis and supporting signals when `status`
+   * is `'error'`.
+   */
+  reason?: EvidenceFailureReason;
+}
+
+export interface EvidenceFailureReason {
+  hypothesis: string;
+  confidence?: number;
+  signals?: string[];
 }
 
 export type EvidenceStage = 'locate' | 'interact' | 'capture';
@@ -141,9 +152,159 @@ export function classifyError(err: unknown): EvidenceErrorCode {
   return 'ACTION_FAILED';
 }
 
+const WEB_ONLY_STRATEGIES = new Set(['css selector']);
+const NATIVE_ONLY_STRATEGIES = new Set([
+  'accessibility id',
+  '-ios predicate string',
+  '-ios class chain',
+  '-android uiautomator',
+]);
+const IOS_ONLY_STRATEGIES = new Set(['-ios predicate string', '-ios class chain']);
+const ANDROID_ONLY_STRATEGIES = new Set(['-android uiautomator']);
+
+/**
+ * Generate a non-authoritative hypothesis and supporting signals explaining why
+ * a tool error likely occurred, based on the classified error code and action
+ * metadata (locator, element, stage, platform, and active context).
+ */
+export function buildFailureReason(
+  error: NonNullable<ActionEvidenceRecord['error']>,
+  input: Pick<EvidenceInput, 'name' | 'stage' | 'locator' | 'element' | 'context'>,
+): EvidenceFailureReason {
+  const signals: string[] = [];
+  const strategy = input.locator?.strategy;
+  const platform = input.context?.platform?.toLowerCase();
+  const contextName = input.context?.contextName;
+
+  if (input.locator) {
+    signals.push(`Locator: ${input.locator.strategy}=${input.locator.selector}`);
+  }
+  if (input.element) {
+    signals.push(`Element ID: ${input.element.webdriverId}`);
+  }
+  if (contextName) {
+    signals.push(`Active context: ${contextName}`);
+  }
+  if (input.context?.platform) {
+    signals.push(`Platform: ${input.context.platform}`);
+  }
+  if (input.stage) {
+    signals.push(`Stage: ${input.stage}`);
+  }
+  signals.push(`Error code: ${error.code}`);
+
+  if (
+    strategy &&
+    platform &&
+    ((IOS_ONLY_STRATEGIES.has(strategy) && platform === 'android') ||
+      (ANDROID_ONLY_STRATEGIES.has(strategy) && platform === 'ios'))
+  ) {
+    signals.unshift(`Platform mismatch: strategy '${strategy}' used on platform '${input.context?.platform}'`);
+    return {
+      hypothesis: `The locator strategy '${strategy}' is not supported on platform '${input.context?.platform}'`,
+      confidence: 0.9,
+      signals,
+    };
+  }
+
+  if (strategy && contextName) {
+    const isWebContext = contextName.toUpperCase().startsWith('WEBVIEW');
+    if (WEB_ONLY_STRATEGIES.has(strategy) && contextName === 'NATIVE_APP') {
+      signals.unshift(
+        `Context mismatch: strategy '${strategy}' requires a WEBVIEW context, but active context is '${contextName}'`,
+      );
+      return {
+        hypothesis:
+          'CSS selector was used while in NATIVE_APP context; switch to a WEBVIEW context or use a native locator strategy',
+        confidence: 0.85,
+        signals,
+      };
+    }
+    if (NATIVE_ONLY_STRATEGIES.has(strategy) && isWebContext) {
+      signals.unshift(`Context mismatch: native strategy '${strategy}' used in web context '${contextName}'`);
+      return {
+        hypothesis: `Native locator strategy '${strategy}' was used while in WEBVIEW context '${contextName}'; switch to NATIVE_APP context or use a CSS/XPath selector`,
+        confidence: 0.85,
+        signals,
+      };
+    }
+  }
+
+  switch (error.code) {
+    case 'ELEMENT_NOT_FOUND': {
+      if (strategy === 'xpath') {
+        signals.unshift('XPath selectors are sensitive to view hierarchy changes');
+        return {
+          hypothesis:
+            'The target element was not found in the current hierarchy; the UI may still be loading, the element may be off-screen, or the XPath selector is too brittle after a hierarchy change',
+          confidence: 0.65,
+          signals,
+        };
+      }
+      return {
+        hypothesis:
+          'The target element was not found in the current hierarchy; the screen may still be loading, blocked by a modal/alert, or the element requires scrolling into view',
+        confidence: 0.7,
+        signals,
+      };
+    }
+    case 'STALE_ELEMENT':
+      return {
+        hypothesis:
+          'The previously located element reference is stale because the UI re-rendered or navigated away; re-locate the element before interacting',
+        confidence: 0.85,
+        signals,
+      };
+    case 'TIMEOUT':
+      if (input.stage === 'locate') {
+        return {
+          hypothesis:
+            'Locating the element timed out; the app may still be loading, blocked by a modal, or the selector does not match the current screen',
+          confidence: 0.75,
+          signals,
+        };
+      }
+      return {
+        hypothesis: 'The operation timed out while waiting for the device or application to respond',
+        confidence: 0.75,
+        signals,
+      };
+    case 'CONTEXT_NOT_AVAILABLE':
+      return {
+        hypothesis:
+          'The requested context is not available; the WebView may not be initialized yet or WebView debugging may be disabled',
+        confidence: 0.85,
+        signals,
+      };
+    case 'INVALID_SELECTOR':
+      return {
+        hypothesis: strategy
+          ? `The selector syntax is invalid for locator strategy '${strategy}'`
+          : 'The selector syntax is invalid for the chosen locator strategy',
+        confidence: 0.9,
+        signals,
+      };
+    case 'ACTION_FAILED':
+      if (input.stage === 'interact') {
+        return {
+          hypothesis:
+            'The interaction failed; the target element may be obscured by an overlay, disabled, or outside the visible viewport',
+          confidence: 0.55,
+          signals,
+        };
+      }
+      return {
+        hypothesis: 'The tool action failed due to an unexpected driver or application error',
+        confidence: 0.4,
+        signals,
+      };
+  }
+}
+
 function buildRecord(result: ContentResult, input: EvidenceInput): ActionEvidenceRecord {
   const finished = Date.now();
   const status: ActionEvidenceRecord['status'] = result.isError || input.error !== undefined ? 'error' : 'success';
+  const resolvedError = status === 'error' ? buildError(input.error, result) : undefined;
 
   return {
     schemaVersion: 1,
@@ -162,7 +323,12 @@ function buildRecord(result: ContentResult, input: EvidenceInput): ActionEvidenc
       finishedAt: new Date(finished).toISOString(),
       durationMs: finished - input.startedAt,
     },
-    ...(status === 'error' ? {error: buildError(input.error, result)} : {}),
+    ...(resolvedError
+      ? {
+          error: resolvedError,
+          reason: buildFailureReason(resolvedError, input),
+        }
+      : {}),
   };
 }
 
