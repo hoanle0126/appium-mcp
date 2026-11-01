@@ -1,3 +1,9 @@
+## [1.99.2](https://github.com/appium/appium-mcp/compare/v1.99.1...v1.99.2) (2026-11-01)
+
+### Bug Fixes
+
+* format for node 22 ([b995075](https://github.com/appium/appium-mcp/commit/b9950757b95f931f8310d6b9696c33f1cf43d4c4))
+
 ## [1.99.1](https://github.com/appium/appium-mcp/compare/v1.99.0...v1.99.1) (2026-10-27)
 
 ### Bug Fixes
